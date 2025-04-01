@@ -18,6 +18,12 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         return label
     }()
     
+    private let overlayView: UIView = {
+        let view = UIView()
+        view.backgroundColor = .clear
+        return view
+    }()
+    
     private let previewContainer: UIView = {
         let view = UIView()
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -50,6 +56,12 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         
         setupConstraints()
     }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        captureSession?.stopRunning()
+    }
+
     
     private func setupPredictionLabel() {
         view.addSubview(predictionLabel)
@@ -85,12 +97,22 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         }
         
         let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession!)
-        view.layer.addSublayer(previewLayer)
-        previewLayer.frame = view.frame
+        previewLayer.videoGravity = .resizeAspectFill
+        previewContainer.layer.addSublayer(previewLayer)
         
         let dataOutput = AVCaptureVideoDataOutput()
         dataOutput.setSampleBufferDelegate(self, queue: DispatchQueue (label: "videoQueue"))
         captureSession?.addOutput(dataOutput)
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        
+        // Update frames after view layout
+        if let previewLayer = previewContainer.layer.sublayers?.first as? AVCaptureVideoPreviewLayer {
+            previewLayer.frame = previewContainer.bounds
+        }
+        overlayView.frame = previewContainer.bounds
     }
     
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -102,7 +124,9 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         
         guard let pixelBuffer: CVPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        let orientation = CGImagePropertyOrientation.right
+        
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
         
         do {
             try handler.perform([handPoseRequest]) // Выполняем запрос на определение руки
@@ -111,10 +135,14 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                 return
             }
             
+            drawHandLandmarks(observation)
+
+            
             guard let features = extractFeatures(from: observation) else {
                 print("⚠️ Failed to extract features")
                 return
             }
+            
             
             guard let predictionIndex = handSignPredictor?.predict(features: features) else {
                 print("⚠️ Prediction failed")
@@ -135,20 +163,52 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     
     func extractFeatures(from observation: VNHumanHandPoseObservation) -> [Double]? {
         do {
-            let allPoints = try observation.recognizedPoints(.all)
-            var features = [Double]()
+            let orderedJoints: [VNHumanHandPoseObservation.JointName] = [
+                .wrist, .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
+                .indexMCP, .indexPIP, .indexDIP, .indexTip,
+                .middleMCP, .middlePIP, .middleDIP, .middleTip,
+                .ringMCP, .ringPIP, .ringDIP, .ringTip,
+                .littleMCP, .littlePIP, .littleDIP, .littleTip
+            ]
             
-            // Заполняем массив координатами x и y всех 21 ключевых точек
-            for landmark in allPoints.values {
-                features.append(Double(landmark.location.x))
-                features.append(Double(landmark.location.y))
+            let allPoints = try observation.recognizedPoints(.all)
+            
+            // First, collect all x and y values to find min values for normalization
+            var xValues: [CGFloat] = []
+            var yValues: [CGFloat] = []
+            
+            for joint in orderedJoints {
+                if let point = allPoints[joint], point.confidence > 0.3 {
+                    xValues.append(point.location.x)
+                    yValues.append(1 - point.location.y)
+                }
             }
             
-            if features.count != 42 { return nil } // Должно быть 21 * 2 = 42 координаты
+            // Find min values for normalization
+            guard let minX = xValues.min(), let minY = yValues.min() else {
+                return nil
+            }
             
-            return features
+            // Build normalized features array
+            var features = [Double]()
+            
+            for joint in orderedJoints {
+                if let point = allPoints[joint], point.confidence > 0.3 {
+                    // Normalize by subtracting min values
+                    let x = point.location.x - minX
+                    let y = 1 - point.location.y - minY
+                    
+                    features.append(Double(x))
+                    features.append(Double(y))
+                } else {
+                    features.append(0.0)
+                    features.append(0.0)
+                }
+            }
+            
+            return features.count == 42 ? features : nil
         } catch {
-            print("⚠️ Error extracting hand features: \(error)")
+            print("Error extracting hand features: \(error)")
             return nil
         }
     }
@@ -171,6 +231,8 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     func setupConstraints() {
         
         view.addSubview(previewContainer)
+        previewContainer.addSubview(overlayView)
+        overlayView.frame = previewContainer.bounds
 
         let stackView = UIStackView(arrangedSubviews: [kazakhButton, russianButton, englishButton])
         stackView.axis = .horizontal
@@ -192,6 +254,69 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             stackView.topAnchor.constraint(equalTo: previewContainer.bottomAnchor, constant: 20),
             stackView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             stackView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-                ])
+        ])
+    }
+    
+    func drawHandLandmarks(_ observation: VNHumanHandPoseObservation) {
+        
+        let HandJointsConnections: [(VNHumanHandPoseObservation.JointName, VNHumanHandPoseObservation.JointName)] = [
+            (.wrist, .thumbCMC), (.thumbCMC, .thumbMP), (.thumbMP, .thumbTip),
+            (.wrist, .indexMCP), (.indexMCP, .indexPIP), (.indexPIP, .indexTip),
+            (.wrist, .middleMCP), (.middleMCP, .middlePIP), (.middlePIP, .middleTip),
+            (.wrist, .ringMCP), (.ringMCP, .ringPIP), (.ringPIP, .ringTip),
+            (.wrist, .littleMCP), (.littleMCP, .littlePIP), (.littlePIP, .littleTip)
+        ]
+        
+        DispatchQueue.main.async {
+            self.overlayView.layer.sublayers?.removeAll()
+            
+            let width = self.overlayView.bounds.width
+            let height = self.overlayView.bounds.height
+            
+            let convertPoint: (CGPoint) -> CGPoint = { point in
+                let convertedX = (1 - point.x) * width  // Swap x and y
+                let convertedY = (1 - point.y) * height
+                return CGPoint(x: convertedX, y: convertedY)
             }
+            
+            let allPoints = try? observation.recognizedPoints(.all)
+            
+            guard let points = allPoints else { return }
+            
+            for jointPair in HandJointsConnections {
+                if let firstPoint = points[jointPair.0],
+                   let secondPoint = points[jointPair.1],
+                   firstPoint.confidence > 0.3,
+                   secondPoint.confidence > 0.3 {
+                    
+                    let p1 = convertPoint(firstPoint.location)
+                    let p2 = convertPoint(secondPoint.location)
+                    
+                    let line = UIBezierPath()
+                    line.move(to: p1)
+                    line.addLine(to: p2)
+                    
+                    let shapeLayer = CAShapeLayer()
+                    shapeLayer.path = line.cgPath
+                    shapeLayer.strokeColor = UIColor.green.cgColor
+                    shapeLayer.lineWidth = 2.0
+                    self.overlayView.layer.addSublayer(shapeLayer)
+                }
+            }
+            
+            // Draw joint points
+            for (_, point) in points where point.confidence > 0.3 {
+                let convertedPoint = convertPoint(point.location)
+                let dot = UIBezierPath(ovalIn: CGRect(x: convertedPoint.x - 3,
+                                                      y: convertedPoint.y - 3,
+                                                      width: 6,
+                                                      height: 6))
+                
+                let dotLayer = CAShapeLayer()
+                dotLayer.path = dot.cgPath
+                dotLayer.fillColor = UIColor.red.cgColor
+                self.overlayView.layer.addSublayer(dotLayer)
+            }
+        }
+    }
 }

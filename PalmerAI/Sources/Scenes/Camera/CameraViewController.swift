@@ -196,7 +196,7 @@ class CameraViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                 if let point = allPoints[joint], point.confidence > 0.3 {
                     // Normalize by subtracting min values
                     let x = point.location.x - minX
-                    let y = 1 - point.location.y - minY
+                    let y = point.location.y - minY
                     
                     features.append(Double(x))
                     features.append(Double(y))
